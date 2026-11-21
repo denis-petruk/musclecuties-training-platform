@@ -1,0 +1,153 @@
+using MuscleCuties.Core.Domain.Workout.Planning;
+using MuscleCuties.Core.Domain.Workout.Planning.Catalog;
+using MuscleCuties.Core.Domain.Health;
+using MuscleCuties.Core.Domain.Workout.Planning.V2;
+using MuscleCuties.Core.Models.Enums.Users;
+using MuscleCuties.Core.Models.Enums.Workout;
+using MuscleCuties.UseCases.Features.Workout.Contracts;
+using MuscleCuties.UseCases.Features.Profile.WorkoutPreferences;
+
+namespace MuscleCuties.UseCases.Features.Workout.Planning;
+
+public sealed record StrengthPlanPreviewRequestV020(
+    WorkoutActivityDto Activity,
+    DateOnly LocalDate,
+    ActivityTrainingHistoryInputV020? ActivityHistory,
+    HashSet<int>? ExcludedExerciseIds = null,
+    HashSet<int>? UserConfirmedFamiliarExerciseIds = null,
+    bool UnknownExperienceAssessmentCompleted = false,
+    HashSet<int>? UserConfirmedManageableLoadExerciseIds = null,
+    HashSet<string>? AcknowledgedSubstitutionPairKeys = null,
+    int? WarmupMinutes = null,
+    int? CooldownMinutes = null)
+{
+    public WorkoutPreferencesDto? DraftPreferences { get; init; }
+    public bool AllowMovementOmissionsForDuration { get; init; }
+    public WorkoutActivityDto? ExplicitStrengthStyleChoice { get; init; }
+    /// <summary>Saved user activity choices used to build the mixed weekly schedule.</summary>
+    public HashSet<int>? SelectedActivityTypes { get; init; }
+
+    public HashSet<DayOfWeek>? AvailableWeekdays { get; init; }
+
+    /// <summary>Saved user session durations; explicit activity answers may refine these for this preview.</summary>
+    public IReadOnlyDictionary<int, int>? ActivitySessionDurationsMinutes { get; init; }
+
+    /// <summary>Saved automatic weekly allocations for activities with a user-configurable frequency.</summary>
+    public IReadOnlyDictionary<int, int>? RequestedSessionsPerWeek { get; init; }
+
+    /// <summary>Explicit per-activity facts needed by the mixed planner; absent values remain unknown.</summary>
+    public IReadOnlyList<ActivityEligibilityInputV020>? ActivityEligibilityEvidence { get; init; }
+
+    public WorkoutActivityDto? HiitUnderlyingCardioActivity { get; init; }
+
+    public HiitEligibilityEvidenceInputV020? HiitEligibilityEvidence { get; init; }
+
+    /// <summary>Input contract version the caller built this request against. Null keeps older
+    /// clients working; any other value must match the build or the preview is refused.</summary>
+    public string? InputContractVersion { get; init; }
+}
+
+public sealed record ActivityEligibilityInputV020(
+    WorkoutActivityDto Activity,
+    ActivityTrainingHistoryInputV020? ActivityHistory = null,
+    bool? HasSwimmingFacilityAccess = null,
+    bool? CanSwimIndependently = null,
+    bool? WantsContinuousSwimming = null,
+    bool? HasRopeClimbingCompetence = null,
+    bool? AppropriateClimbingInstructionAvailable = null,
+    bool? IsDemandingYogaContent = null,
+    int? YogaSessionDurationMinutes = null);
+
+public sealed record HiitEligibilityEvidenceInputV020(
+    ActivityTrainingHistoryInputV020? UnderlyingCardioHistory = null,
+    IReadOnlyList<HiitAerobicWeekInputV020>? PreviousFourWeeksAerobicEvidence = null,
+    bool? ExistingClearanceScreeningSatisfied = null);
+
+public sealed record HiitAerobicWeekInputV020(
+    int WeekOffsetFromCurrent,
+    int QualifyingManageableAerobicSessionCount);
+
+public sealed record ActivityTrainingHistoryInputV020(
+    string ActivityId,
+    int? ConsistentParticipationWeeks,
+    decimal? AverageSessionsPerWeekInRecentFourWeeks,
+    DateOnly? LastCompletedSessionDate,
+    bool IsSelfReported);
+
+public sealed record StrengthPlanPreviewSourceV020(
+    UserGoal Goal,
+    Equipment Equipment,
+    InjuryFlag ActiveInjuryFlags,
+    bool HasCurrentSymptoms,
+    IReadOnlyList<StrengthExerciseCatalogEntry> Catalog,
+    IReadOnlyDictionary<int, int> PreferredExerciseByOriginalId,
+    IReadOnlySet<int> AcceptedExerciseIds,
+    IReadOnlyDictionary<int, int> CompletedExerciseExposureCounts,
+    IReadOnlySet<int> KnownManageableLoadExerciseIds,
+    IReadOnlyDictionary<int, int> SecondsPerRepByExerciseId,
+    IReadOnlyDictionary<int, string> PrimaryMuscleByExerciseId,
+    IReadOnlyDictionary<string, IReadOnlySet<int>> ReviewedAllowedExerciseIdsByTemplateSlot,
+    IReadOnlyDictionary<string, string> TemplateSlotReviewConditions)
+{
+    public DateOnly? BirthDate { get; init; }
+    public PregnancyStatus PregnancyStatus { get; init; } = PregnancyStatus.No;
+    public string AccountTimeZoneId { get; init; } = "UTC";
+    public int DistinctCompletedWorkoutDays { get; init; }
+    public bool IsReturningAfterDetraining { get; init; }
+    public IReadOnlyList<ObservedSetRecordV2> PriorObservedSets { get; init; } = [];
+    public IReadOnlyList<CardioActualRecordV2> PriorCardioActuals { get; init; } = [];
+    public IReadOnlyList<PainRestrictionV2> PainRestrictions { get; init; } = [];
+    public DailyReadinessInputV2? DailyReadiness { get; init; }
+    public IReadOnlySet<int>? SelectedActivityTypes { get; init; }
+    public IReadOnlySet<int>? ExcludedExerciseIds { get; init; }
+    public IReadOnlySet<DayOfWeek>? AvailableWeekdays { get; init; }
+    public IReadOnlyDictionary<int, int>? ActivitySessionDurationsMinutes { get; init; }
+    public IReadOnlyDictionary<int, int>? RequestedSessionsPerWeek { get; init; }
+    public TrainingExperienceLevel? ProfileTrainingExperience { get; init; }
+    public IReadOnlyDictionary<int, int>? GoalPriorityByExerciseId { get; init; }
+    public IReadOnlyDictionary<int, IReadOnlySet<string>>? MuscleGroupsByExerciseId { get; init; }
+    public IReadOnlyDictionary<string, ReviewedTemplateFloorDto>? TemplateVolumeFloors { get; init; }
+    public int? ProfileVersion { get; init; }
+    /// <summary>Server-derived scope limitation; absent in pure generator fixtures.</summary>
+    public string? PopulationLimitationCode { get; init; }
+    public string? InjuryFingerprint { get; init; }
+    public Guid? ActivePlanId { get; init; }
+    public Guid? ActiveRevisionId { get; init; }
+    public string? HistoryFingerprint { get; init; }
+    public string? CatalogFingerprint { get; init; }
+    public long TimeZoneVersion { get; init; }
+    public DateOnly? CurrentAccountLocalDate { get; init; }
+    public long ExperienceVersion { get; init; }
+    public long AnswerVersion { get; init; }
+    public string? ObservedHistoryFingerprint { get; init; }
+    public long? ReadinessRevision { get; init; }
+    public SavedActivityAnswersDto? SavedAnswers { get; init; }
+    /// <summary>Activities an active injury blocks under the reviewed site/status rules.
+    /// Strength styles are never listed; their safety is enforced per exercise.</summary>
+    public IReadOnlySet<int>? RestrictedActivityTypes { get; init; }
+
+    /// <summary>Movement patterns blocked by recorded injury safety answers. Null means no
+    /// answer-driven evidence, not that no injury exists.</summary>
+    public IReadOnlySet<MovementPattern>? BlockedMovementPatterns { get; init; }
+
+    /// <summary>True when the saved equipment answer is missing or unreadable. <see cref="Equipment"/>
+    /// then holds a placeholder that planning never uses; a draft equipment level can supply it.</summary>
+    public bool EquipmentAnswerMissing { get; init; }
+
+    /// <summary>True when the saved goal answer is missing or unreadable; <see cref="Goal"/> is a placeholder.</summary>
+    public bool GoalAnswerMissing { get; init; }
+
+    /// <summary>User-selected glute focus, stored on the profile. Absent means no focus.</summary>
+    public bool GluteFocus { get; init; }
+
+    public IReadOnlyDictionary<int, IReadOnlyList<CatalogMuscleRow>>? MuscleContributionsByExerciseId { get; init; }
+    public EquipmentCapabilities? DraftEquipmentCapabilities { get; init; }
+}
+
+public sealed record ReviewedTemplateFloorDto(string TemplateId, int MinimumWorkingSets, int MinimumExercises,
+    IReadOnlyDictionary<string, int> MinimumSetsBySlotId);
+
+public interface IStrengthPlanPreviewSourceV020
+{
+    Task<StrengthPlanPreviewSourceV020?> LoadAsync(Guid userId, CancellationToken cancellationToken);
+}

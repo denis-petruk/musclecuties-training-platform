@@ -1,0 +1,859 @@
+using MuscleCuties.Core.Models.Enums.Users;
+using MuscleCuties.Core.Models.Enums.Workout;
+
+namespace MuscleCuties.Core.Domain.Workout.Planning;
+
+public enum StrengthPlanPreviewStatus
+{
+    Feasible,
+    Limited,
+    InvalidInput
+}
+
+public sealed record StrengthPlanPreviewChoices(
+    WorkoutActivityType Activity,
+    DateOnly LocalDate,
+    ActivityTrainingHistory? ActivityHistory,
+    IReadOnlySet<int>? ExcludedExerciseIds = null,
+    IReadOnlySet<int>? UserConfirmedFamiliarExerciseIds = null,
+    bool UnknownExperienceAssessmentCompleted = false,
+    IReadOnlySet<int>? UserConfirmedManageableLoadExerciseIds = null,
+    IReadOnlySet<string>? AcknowledgedSubstitutionPairKeys = null,
+    int? WarmupMinutes = null,
+    int? CooldownMinutes = null,
+    IReadOnlySet<DayOfWeek>? RequestedAvailableWeekdays = null,
+    bool AllowMovementOmissionsForDuration = false);
+
+public sealed record EquipmentCapabilities(
+    bool? HasSliders = null,
+    bool? HasConfirmedBandAnchor = null,
+    bool? HasDumbbells = null,
+    bool? HasBands = null);
+
+/// <summary>Trusted server profile, activity preferences, and reviewed catalog snapshot used by the planner.</summary>
+public sealed record StrengthPlanPreviewData(
+    UserGoal Goal,
+    Equipment Equipment,
+    InjuryFlag ActiveInjuryFlags,
+    bool HasCurrentSymptoms,
+    IReadOnlySet<WorkoutActivityType>? SelectedActivities,
+    IReadOnlySet<DayOfWeek>? AvailableWeekdays,
+    IReadOnlyDictionary<WorkoutActivityType, int>? ActivitySessionDurationsMinutes,
+    TrainingExperienceLevel? ProfileTrainingExperience,
+    IReadOnlyList<StrengthExerciseCatalogEntry>? Catalog,
+    IReadOnlyDictionary<int, int>? PreferredExerciseByOriginalId,
+    IReadOnlySet<int>? AcceptedExerciseIds,
+    IReadOnlyDictionary<int, int>? CompletedExerciseExposureCounts,
+    IReadOnlySet<int>? KnownManageableLoadExerciseIds,
+    IReadOnlyDictionary<int, int>? SecondsPerRepByExerciseId,
+    IReadOnlyDictionary<int, string>? PrimaryMuscleByExerciseId,
+    IReadOnlyDictionary<string, IReadOnlySet<int>>? ReviewedAllowedExerciseIdsByTemplateSlot,
+    IReadOnlyDictionary<string, string>? TemplateSlotReviewConditions)
+{
+    public IReadOnlyDictionary<int, int>? GoalPriorityByExerciseId { get; init; }
+    public IReadOnlyDictionary<int, ExerciseEvidenceRanking>? EvidenceRankingByExerciseId { get; init; }
+
+    /// <summary>True only when the user selected glute focus in their profile; selection then prefers
+    /// glute-dominant movements inside a slot. Never inferred from goal, body type or history.</summary>
+    public bool GluteFocus { get; init; }
+    public IReadOnlyDictionary<int, IReadOnlySet<string>>? MuscleGroupsByExerciseId { get; init; }
+    public IReadOnlyDictionary<string, TemplateVolumeFloor>? TemplateVolumeFloors { get; init; }
+    /// <summary>Server-derived activities an active injury blocks. Strength styles are never
+    /// activity-restricted: their safety is enforced per exercise by contraindication filtering
+    /// and injury provenance. Absent evidence falls back to the symptom flag.</summary>
+    public IReadOnlySet<WorkoutActivityType>? RestrictedActivities { get; init; }
+    /// <summary>Movement patterns blocked by recorded injury safety answers. Selecting an exercise
+    /// with one of these patterns is a safety failure, exactly like a site contraindication.</summary>
+    public IReadOnlySet<MovementPattern>? BlockedMovementPatterns { get; init; }
+    public EquipmentCapabilities? EquipmentCapabilities { get; init; }
+}
+
+public sealed record StrengthPlanPreviewSession(
+    string TemplateId,
+    string TemplateVersion,
+    int SessionIndex,
+    decimal? EstimatedMinutes,
+    IReadOnlyList<StrengthSlotSelection> Slots,
+    IReadOnlyList<string> LimitationCodes,
+    IReadOnlyDictionary<string, string> SlotReviewConditions,
+    DayOfWeek? PlannedWeekday = null,
+    int? OriginalPlannedWorkingSets = null,
+    int? ActualWorkingSets = null);
+
+/// <summary>Exercise-specific review text. Both fields stay null when the catalog has nothing
+/// to say, so no empty rationale entry is ever produced for an unreviewed exercise.</summary>
+public sealed record StrengthExerciseReviewCondition(
+    int ExerciseId,
+    string ExerciseName,
+    string? ExperienceConditions,
+    string? ReviewConditions);
+
+public sealed record StrengthPlanPreviewResult(
+    StrengthPlanPreviewStatus Status,
+    ActivityExperience Experience,
+    IReadOnlyList<StrengthPlanPreviewSession> Sessions,
+    IReadOnlyList<string> LimitationCodes,
+    IReadOnlyList<StrengthExerciseReviewCondition> ExerciseReviewConditions,
+    IReadOnlyList<string> AdvisoryCodes,
+    WorkoutActivityType? EffectiveActivity = null,
+    string? FallbackSource = null,
+    string? FallbackReasonCode = null,
+    int? StrengthSessionLimitMinutes = null,
+    bool RequiresReducedVolumeAcknowledgment = false,
+    int? OriginalPlannedWorkingSets = null,
+    int? ActualWorkingSets = null,
+    decimal? MinimumRequiredSessionMinutes = null);
+
+/// <summary>
+/// Evaluates a strength proposal as one Core decision using activity policy, reviewed templates,
+/// exercise eligibility, selected activity duration, and shared weekday availability.
+/// </summary>
+public static class StrengthPlanPreviewRule
+{
+    /// <summary>
+    /// Version of the preview input contract this build implements. A request that names a different
+    /// version is refused instead of being answered from defaults.
+    /// </summary>
+    public const string InputContractVersion = "MC-PLANNING-INPUT-1";
+
+    public const string UnsupportedInputVersionCode = "UnsupportedPlanningInputVersion";
+
+    public const string PolicyId = "MC-WORKOUT-POLICY";
+    public const string Version = "0.2.0";
+    public const string RulesetVersion = "MC-PLANNING-0.4";
+    public const string InvalidInputCode = "InvalidStrengthPreviewInput";
+    public const string PlanningProfileInvalidCode = "PlanningProfileDataInvalid";
+    public const string ActivityNotSelectedCode = "ActivityNotSelectedInProfile";
+    public const string WeekdaysMissingCode = "AvailableWeekdaysMissing";
+    public const string SessionDurationMissingCode = "SessionDurationMissing";
+    public const string SessionDurationInvalidCode = "SelectedActivityDurationInvalid";
+    public const string ExperienceHistoryMissingCode = "ActivityExperienceHistoryMissing";
+    public const string BeginnerProfileRequiresGeneralStrengthCode =
+        "BeginnerProfileRequiresGeneralStrength";
+    public const string HighVolumeRequiresEstablishedResistanceHistoryCode =
+        "HighVolumeRequiresEstablishedResistanceHistory";
+    public const string GeneralStrengthFallbackSource =
+        "GeneralStrengthFallback";
+    public const string SymptomsNeedReviewCode = "RestrictionOrSymptomRequiresReview";
+    public const string MissingWarmupOrCooldownCode = "StrengthWarmupOrCooldownDurationMissing";
+    public const string ReducedVolumeNotice = "StrengthVolumeReducedToFitDurationOrSchedule";
+    public const string MovementOmittedForDurationCode = "MovementOmittedForDuration";
+    /// <summary>Advisory prefix for a session removed because no permitted strength block remained.</summary>
+    public const string SessionWithheldCodePrefix = "SessionWithheld:";
+    public const string NoSafeStrengthContentRemainingCode = "NoSafeStrengthContentRemaining";
+
+    private const int NoMinutes = 0;
+    private const int FirstPositiveIdentifier = 1;
+    private const int OneSession = 1;
+    private const int NoSessions = 0;
+    private const int NoCompletedExposures = 0;
+    private const int NoSetupMinutes = 0;
+    private const int NoSecondsPerRep = 0;
+    private const int SecondsPerMinute = 60;
+    private const int NoDirectSets = 0;
+    private const int UnilateralTimeMultiplier = 2;
+    private const int StandardTimeMultiplier = 1;
+    private const string MissingTemplateSlotReview = "Template slot review missing";
+    private static readonly IReadOnlyList<string> NoCodes = Array.Empty<string>();
+    private static readonly IReadOnlySet<int> EmptyIds = new HashSet<int>();
+    private static readonly IReadOnlySet<MovementPattern> EmptyMovementPatterns = new HashSet<MovementPattern>();
+
+    public static StrengthPlanPreviewResult Evaluate(
+        StrengthPlanPreviewChoices? choices,
+        StrengthPlanPreviewData? data) =>
+        EvaluateWithFallback(choices, data);
+
+    public static StrengthPlanPreviewResult EvaluateDirect(
+        StrengthPlanPreviewChoices? choices,
+        StrengthPlanPreviewData? data)
+    {
+        if (!ValidChoices(choices))
+            return Failure(StrengthPlanPreviewStatus.InvalidInput, ActivityExperience.Unknown,
+                InvalidInputCode);
+        if (data is null || !ValidProfileData(data))
+            return Failure(StrengthPlanPreviewStatus.InvalidInput, ActivityExperience.Unknown,
+                PlanningProfileInvalidCode);
+
+        var activity = choices!.Activity;
+
+        // Every recoverable prerequisite is collected before returning, so the user sees the whole
+        // remaining setup in one pass instead of rediscovering each gap after a reload.
+        var prerequisites = new List<string>();
+
+        if (data.SelectedActivities is null || !data.SelectedActivities.Contains(activity))
+            prerequisites.Add(ActivityNotSelectedCode);
+
+        if (data.ActivitySessionDurationsMinutes is null)
+        {
+            prerequisites.Add(SessionDurationMissingCode);
+        }
+        else if (data.ActivitySessionDurationsMinutes.Any(pair => !Enum.IsDefined(pair.Key) ||
+                 pair.Key == activity && !IsValidActivityDuration(pair.Key, pair.Value)))
+        {
+            // Structurally invalid data is not a user-recoverable prerequisite.
+            return Failure(StrengthPlanPreviewStatus.InvalidInput, ActivityExperience.Unknown,
+                SessionDurationInvalidCode);
+        }
+
+        var sessionMinutes = NoMinutes;
+        if (data.ActivitySessionDurationsMinutes is not null &&
+            !data.ActivitySessionDurationsMinutes.TryGetValue(activity, out sessionMinutes))
+            prerequisites.Add(SessionDurationMissingCode);
+
+        var weekdays = data.AvailableWeekdays ?? choices.RequestedAvailableWeekdays;
+        if (!ValidWeekdays(weekdays))
+            prerequisites.Add(WeekdaysMissingCode);
+        else if (choices.RequestedAvailableWeekdays is not null && data.AvailableWeekdays is not null &&
+                 !choices.RequestedAvailableWeekdays.SetEquals(data.AvailableWeekdays))
+            prerequisites.Add("SavedWorkoutAvailabilityChanged");
+
+        if (choices.WarmupMinutes is null || choices.CooldownMinutes is null)
+            prerequisites.Add(MissingWarmupOrCooldownCode);
+
+        if (activity == WorkoutActivityType.StrengthHighIntensity)
+            prerequisites.Add(ActivityPrescriptionRule.HighIntensitySaferAlternativeReviewMissing);
+
+        var experience = ActivityExperienceRule.Classify(activity.ToString(), choices.ActivityHistory,
+            choices.LocalDate).Experience;
+
+        // High-intensity strength is gated by its safer-prescription review, not by an experience
+        // question, so it must not also report a missing experience answer.
+        if (activity is not (WorkoutActivityType.GeneralStrength or
+                WorkoutActivityType.HighVolumeStrength or WorkoutActivityType.StrengthHighIntensity) &&
+            experience == ActivityExperience.Unknown &&
+            !choices.UnknownExperienceAssessmentCompleted)
+            prerequisites.Add(ExperienceHistoryMissingCode);
+
+        if (prerequisites.Count > NoSessions)
+        {
+            return new StrengthPlanPreviewResult(
+                StrengthPlanPreviewStatus.Limited,
+                experience,
+                [],
+                prerequisites.Distinct(StringComparer.Ordinal)
+                    .OrderBy(value => value, StringComparer.Ordinal).ToArray(),
+                [],
+                []);
+        }
+
+        var profileExperienceDecision = ProfileTrainingExperiencePlanningRule.Resolve(
+            experience, data.ProfileTrainingExperience, choices.ActivityHistory,
+            allowProfileFallbackWhenHistoryMissing: true);
+        var prescriptionExperience = EligibilityExperience(activity, profileExperienceDecision);
+
+        if ((activity is WorkoutActivityType.GeneralStrength or WorkoutActivityType.HighVolumeStrength) &&
+            experience == ActivityExperience.Unknown)
+            experience = ActivityExperience.Beginner;
+
+        var availableEquipment = AvailableEquipmentFor(data.Equipment, data.EquipmentCapabilities);
+        var eligibilityContext = new ExerciseEligibilityContext(availableEquipment, prescriptionExperience,
+            choices.ExcludedExerciseIds ?? EmptyIds, data.BlockedMovementPatterns ?? EmptyMovementPatterns,
+            new HashSet<ActivityDemandTag>(), false, data.ActiveInjuryFlags,
+            choices.UnknownExperienceAssessmentCompleted, choices.AcknowledgedSubstitutionPairKeys);
+        var isEstablishedResistanceHistory = GeneralStrengthFrequencyResolver.IsEstablishedResistanceHistory(
+            choices.ActivityHistory, choices.LocalDate);
+        var isActivityRestricted = data.RestrictedActivities?.Contains(activity) ?? data.HasCurrentSymptoms;
+        var prescriptionContext = new ActivityPrescriptionContext(activity, prescriptionExperience, null,
+            isActivityRestricted, true, isEstablishedResistanceHistory,
+            NoCompletedExposures, false, false);
+        var scheduledSessionsPerWeek = ScheduledSessionsPerWeekFor(activity, data, choices);
+        var templates = StrengthTemplateCatalog.ForSchedule(scheduledSessionsPerWeek);
+        if (templates.Count == NoSessions)
+            return Failure(StrengthPlanPreviewStatus.InvalidInput, experience, InvalidInputCode);
+
+        var sessions = new List<StrengthPlanPreviewSession>(templates.Count);
+        var weeklySessionMuscles = new List<IReadOnlyCollection<string>?>();
+        var weeklySetsByMuscle = new Dictionary<string, int>(StringComparer.Ordinal);
+        var limitations = new List<string>();
+        var movementOmissions = new List<string>();
+        var withheldSessions = new List<string>();
+        var anyVolumeReduced = false;
+        var totalOriginalWorkingSets = 0;
+        var totalActualWorkingSets = 0;
+        decimal? minimumRequiredSessionMinutes = null;
+
+        foreach (var originalTemplate in templates)
+        {
+            var template = originalTemplate;
+            IReadOnlyList<StrengthSlotSelection> preservedOmissions = [];
+            var coveragePriority = LowerBodyCoverageRule.PriorityExerciseIds(
+                LowerBodyCoverageRule.Evaluate(weeklySessionMuscles).BelowMinimum,
+                data.MuscleGroupsByExerciseId, data.Catalog);
+            var selectionInput = new StrengthTemplateSelectionInput(template, activity, data.Goal,
+                    prescriptionContext, data.Catalog!, eligibilityContext,
+                    data.PreferredExerciseByOriginalId!,
+                    data.CompletedExerciseExposureCounts!.Keys.ToHashSet(),
+                    data.CompletedExerciseExposureCounts.Keys.ToHashSet(),
+                    data.AcceptedExerciseIds,
+                    CompletedExerciseExposureCounts: data.CompletedExerciseExposureCounts,
+                    KnownManageableLoadExerciseIds: data.KnownManageableLoadExerciseIds,
+                    UserConfirmedFamiliarityExerciseIds:
+                        choices.UserConfirmedFamiliarExerciseIds ?? EmptyIds,
+                    ReviewedAllowedExerciseIdsByTemplateSlot: data.ReviewedAllowedExerciseIdsByTemplateSlot,
+                    UserConfirmedManageableLoadExerciseIds:
+                        choices.UserConfirmedManageableLoadExerciseIds ?? EmptyIds,
+                    GoalPriorityByExerciseId: MergeCoveragePriority(
+                        data.GoalPriorityByExerciseId, coveragePriority),
+                    EvidenceRankingByExerciseId: data.EvidenceRankingByExerciseId,
+                    GluteFocus: data.GluteFocus);
+            var resolution = StrengthTemplateResolver.Resolve(selectionInput, MaximumWorkingExercises(activity, template));
+            if (resolution.Slots.Any(slot => slot.IsRequired && slot.Outcome == StrengthSlotResolutionOutcome.NoSafeCandidate))
+            {
+                foreach (var alternative in StrengthTemplateCatalog.AlternativesForSchedule(scheduledSessionsPerWeek, template))
+                {
+                    var alternativeResolution = StrengthTemplateResolver.Resolve(selectionInput with { Template = alternative },
+                        MaximumWorkingExercises(activity, alternative));
+                    if (alternativeResolution.Status != "Resolved") continue;
+                    template = alternative;
+                    resolution = alternativeResolution;
+                    break;
+                }
+            }
+
+            if (resolution.Status != "Resolved")
+            {
+                var unresolvedSlots = resolution.Slots.Where(slot => slot.IsRequired && !slot.ExerciseId.HasValue).ToArray();
+                var safeOmission = resolution.Status == "Limited" && unresolvedSlots.Length > 0 &&
+                    unresolvedSlots.All(slot => slot.Outcome == StrengthSlotResolutionOutcome.NoSafeCandidate) &&
+                    resolution.Slots.Any(slot => slot.ExerciseId.HasValue);
+                // Owner requirement: a session the reviewed rules empty for safety is removed and
+                // disclosed, and the rest of the week is kept. Missing review data still blocks.
+                var safetyEmptied = resolution.Status == "Limited" && unresolvedSlots.Length > 0 &&
+                    unresolvedSlots.All(slot => slot.Outcome == StrengthSlotResolutionOutcome.NoSafeCandidate) &&
+                    !resolution.Slots.Any(slot => slot.ExerciseId.HasValue);
+                if (safetyEmptied)
+                {
+                    withheldSessions.Add($"{SessionWithheldCodePrefix}{template.TemplateId}");
+                    totalOriginalWorkingSets += resolution.Slots.Where(slot => slot.IsRequired)
+                        .Sum(slot => slot.Sets.GetValueOrDefault());
+                    anyVolumeReduced = true;
+                    continue;
+                }
+                if (!safeOmission)
+                {
+                    limitations.AddRange(resolution.LimitationCodes);
+                    sessions.Add(new StrengthPlanPreviewSession(template.TemplateId, template.Version,
+                        template.SessionIndex, null, resolution.Slots, resolution.LimitationCodes,
+                        SlotConditions(template, data)));
+                    continue;
+                }
+                movementOmissions.AddRange(unresolvedSlots.Select(slot => $"MovementOmitted:{template.TemplateId}:{slot.SlotId}"));
+                preservedOmissions = unresolvedSlots;
+            }
+
+            var originalWorkingSetsInSession = resolution.Slots
+                .Where(slot => slot.ExerciseId.HasValue)
+                .Sum(slot => slot.Sets.GetValueOrDefault());
+            totalOriginalWorkingSets += originalWorkingSetsInSession;
+
+            var selected = resolution.Slots.Where(slot => slot.ExerciseId.HasValue).ToList();
+            var floor = TemplateVolumeFloorRule.ForAvailableSlots(template.TemplateId, selected);
+            var estimatedMinutes = EstimateAndTrimOptional(selected, data, sessionMinutes,
+                choices.WarmupMinutes!.Value, choices.CooldownMinutes!.Value, floor,
+                choices.AllowMovementOmissionsForDuration, template.TemplateId, movementOmissions,
+                out var completeMinimumMinutes);
+            if (completeMinimumMinutes is { } completeMinimum)
+                minimumRequiredSessionMinutes = Math.Max(minimumRequiredSessionMinutes ?? completeMinimum, completeMinimum);
+            floor = TemplateVolumeFloorRule.ForAvailableSlots(template.TemplateId, selected);
+
+            var applyDirectSetCeiling = activity == WorkoutActivityType.HighVolumeStrength ||
+                activity == WorkoutActivityType.GeneralStrength &&
+                prescriptionExperience == ActivityExperience.Beginner;
+            if (applyDirectSetCeiling)
+            {
+                var directSetCeiling = activity == WorkoutActivityType.GeneralStrength
+                    ? WeeklyHypertrophyVolumeRule.Tier1HardCapSets
+                    : data.ProfileTrainingExperience is null or TrainingExperienceLevel.Unknown
+                        ? ActivityPrescriptionRule.HighVolumeInitialDirectSetsPerPrimaryMusclePerWeek
+                        : profileExperienceDecision.MaximumWeeklySetsPerMuscle;
+                var provisionalSetsByMuscle = new Dictionary<string, int>(StringComparer.Ordinal);
+                foreach (var slot in selected.ToArray())
+                {
+                    var exerciseId = slot.ExerciseId!.Value;
+                    if (!data.PrimaryMuscleByExerciseId!.TryGetValue(exerciseId, out var muscle) ||
+                        string.IsNullOrWhiteSpace(muscle))
+                    {
+                        limitations.Add($"PrimaryMuscleMissing:{exerciseId}");
+                        continue;
+                    }
+
+                    var projectedSets = weeklySetsByMuscle.GetValueOrDefault(muscle) +
+                                        provisionalSetsByMuscle.GetValueOrDefault(muscle) +
+                                        slot.Sets.GetValueOrDefault();
+                    if (projectedSets > directSetCeiling &&
+                        !slot.IsRequired)
+                    {
+                        selected.Remove(slot);
+                        continue;
+                    }
+
+                    provisionalSetsByMuscle[muscle] = provisionalSetsByMuscle.GetValueOrDefault(muscle) +
+                                                  slot.Sets.GetValueOrDefault();
+                    if (projectedSets > directSetCeiling)
+                        limitations.Add($"DirectSetCeilingExceeded:{muscle}");
+                }
+
+                estimatedMinutes = EstimateAndTrimOptional(selected, data, sessionMinutes,
+                    choices.WarmupMinutes.Value, choices.CooldownMinutes.Value, floor,
+                    choices.AllowMovementOmissionsForDuration, template.TemplateId, movementOmissions,
+                    out var laterMinimumMinutes);
+                if (laterMinimumMinutes is { } laterMinimum)
+                    minimumRequiredSessionMinutes = Math.Max(minimumRequiredSessionMinutes ?? laterMinimum, laterMinimum);
+                floor = TemplateVolumeFloorRule.ForAvailableSlots(template.TemplateId, selected);
+                if (estimatedMinutes.HasValue)
+                    foreach (var slot in selected)
+                    {
+                        var exerciseId = slot.ExerciseId!.Value;
+                        if (data.PrimaryMuscleByExerciseId!.TryGetValue(exerciseId, out var muscle) &&
+                            !string.IsNullOrWhiteSpace(muscle))
+                            weeklySetsByMuscle[muscle] = weeklySetsByMuscle.GetValueOrDefault(muscle) +
+                                slot.Sets.GetValueOrDefault();
+                    }
+            }
+
+            var actualWorkingSetsInSession = selected.Sum(slot => slot.Sets.GetValueOrDefault());
+            totalActualWorkingSets += actualWorkingSetsInSession;
+
+            if (actualWorkingSetsInSession < originalWorkingSetsInSession)
+            {
+                anyVolumeReduced = true;
+            }
+
+            var floorEvaluation = TemplateVolumeFloorRule.EvaluateSelections(template.TemplateId,
+                selected, new Dictionary<string, TemplateVolumeFloor> { [template.TemplateId] = floor });
+            if (!floorEvaluation.IsAllowed)
+                limitations.Add(floorEvaluation.LimitationCode ?? TemplateVolumeFloorRule.VolumeBelowTemplateFloor);
+
+            IReadOnlyList<string> sessionLimitations = estimatedMinutes.HasValue
+                ? NoCodes
+                : ["RequiredMovementWorkExceedsSessionDurationOrTimingMissing"];
+            if (!estimatedMinutes.HasValue)
+            {
+                limitations.AddRange(sessionLimitations);
+            }
+            var selectedIds = selected.Select(slot => slot.SlotId).ToHashSet(StringComparer.Ordinal);
+            var omittedIds = preservedOmissions.Select(slot => slot.SlotId).ToHashSet(StringComparer.Ordinal);
+            var sessionSlots = resolution.Slots
+                .Where(slot => selectedIds.Contains(slot.SlotId) || omittedIds.Contains(slot.SlotId))
+                .Select(slot => selected.FirstOrDefault(selectedSlot => selectedSlot.SlotId == slot.SlotId) ?? slot)
+                .ToArray();
+            sessions.Add(new StrengthPlanPreviewSession(template.TemplateId, template.Version,
+                template.SessionIndex, estimatedMinutes, sessionSlots, sessionLimitations,
+                SlotConditions(template, data),
+                OriginalPlannedWorkingSets: originalWorkingSetsInSession,
+                ActualWorkingSets: actualWorkingSetsInSession));
+            AddSessionMuscles(sessionSlots, data.MuscleGroupsByExerciseId, weeklySessionMuscles);
+        }
+
+        if (sessions.Count == NoSessions && withheldSessions.Count > NoSessions)
+            limitations.Add(NoSafeStrengthContentRemainingCode);
+
+        // Review data must remain a hard prerequisite even when an initial weekday assignment fails.
+        if (sessions.SelectMany(session => session.Slots).Where(slot => slot.ExerciseId.HasValue)
+            .Any(slot => data.MuscleGroupsByExerciseId is null ||
+                !data.MuscleGroupsByExerciseId.TryGetValue(slot.ExerciseId!.Value, out var groups) ||
+                groups.Count == 0 || groups.Any(string.IsNullOrWhiteSpace)))
+            limitations.Add(WorkoutScheduleValidationRule.StrengthMuscleMetadataMissing);
+        var assignments = StrengthWeekdayAssignmentRule.Assign(sessions.Count, weekdays!);
+        if (assignments.Status != StrengthWeekdayAssignmentStatus.Assigned)
+            limitations.Add(assignments.LimitationCode ?? "StrengthWeekdayAssignmentUnavailable");
+        else
+        {
+            var weekdayBySession = assignments.Assignments.ToDictionary(item => item.SessionIndex,
+                item => item.Weekday);
+            for (var index = NoSessions; index < sessions.Count; index++)
+                sessions[index] = sessions[index] with { PlannedWeekday = weekdayBySession[index] };
+        }
+
+        if (assignments.Status == StrengthWeekdayAssignmentStatus.Assigned)
+        {
+            var validationSessions = sessions.Where(session => session.Slots.Any(slot => slot.ExerciseId.HasValue))
+                .Select(session =>
+            {
+                var muscles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var missingMuscle = false;
+                foreach (var slot in session.Slots.Where(slot => slot.ExerciseId.HasValue))
+                {
+                    if (data.MuscleGroupsByExerciseId is null ||
+                        !data.MuscleGroupsByExerciseId.TryGetValue(slot.ExerciseId!.Value, out var exerciseMuscles) ||
+                        exerciseMuscles.Count == 0 || exerciseMuscles.Any(string.IsNullOrWhiteSpace))
+                        missingMuscle = true;
+                    else
+                        muscles.UnionWith(exerciseMuscles);
+                }
+                return new WorkoutScheduleValidationSession(session.PlannedWeekday!.Value, activity, true,
+                    missingMuscle ? null : muscles);
+            }).ToArray();
+            limitations.AddRange(WorkoutScheduleValidationRule.Validate(validationSessions)
+                .Where(code => code != WorkoutScheduleValidationRule.ConsecutiveStrengthMuscleGroups));
+        }
+
+        var advisories = new List<string>(profileExperienceDecision.ReasonCodes);
+        var tenRegionCoverage = TenRegionMuscleCoverageRule.Evaluate(
+            weeklySessionMuscles, scheduledSessionsPerWeek);
+        if (data.MuscleGroupsByExerciseId is not null && data.MuscleGroupsByExerciseId.Count > 0)
+        {
+            if (!tenRegionCoverage.MeetsMinimum)
+            {
+                // Limited weekly exposure is disclosed but does not itself make a safe one-day plan unusable.
+                advisories.AddRange(tenRegionCoverage.LimitationCodes);
+            }
+            advisories.AddRange(tenRegionCoverage.AdvisoryCodes);
+        }
+
+        var limitationCodes = limitations.Distinct(StringComparer.Ordinal)
+            .OrderBy(value => value, StringComparer.Ordinal).ToArray();
+        var reviewConditions = ExerciseReviewConditions(templates, data);
+        advisories.AddRange(LowerBodyCoverageRule.Evaluate(weeklySessionMuscles).BelowMinimum
+            .Select(LowerBodyCoverageRule.GapCode));
+        advisories.AddRange(movementOmissions);
+        advisories.AddRange(withheldSessions);
+        if (scheduledSessionsPerWeek == OneSession)
+            advisories.Add("OneDayFullBodyHasLimitedWeeklyCoverage");
+        if (activity == WorkoutActivityType.GeneralStrength &&
+            (data.ProfileTrainingExperience == TrainingExperienceLevel.Beginner ||
+             profileExperienceDecision.EffectiveExperienceLevel == TrainingExperienceLevel.Beginner ||
+             prescriptionExperience == ActivityExperience.Beginner))
+        {
+            advisories.Add("DirectBeginnerGeneralStrengthSettingsApplied");
+        }
+
+        var requiresReducedVolumeAcknowledgment = anyVolumeReduced;
+        if (requiresReducedVolumeAcknowledgment)
+        {
+            advisories.Add(ReducedVolumeNotice);
+        }
+
+        return new StrengthPlanPreviewResult(
+            limitationCodes.Length == NoSessions
+                ? StrengthPlanPreviewStatus.Feasible : StrengthPlanPreviewStatus.Limited,
+            experience, sessions, limitationCodes, reviewConditions,
+            advisories.Distinct(StringComparer.Ordinal).OrderBy(value => value, StringComparer.Ordinal).ToArray(),
+            activity, StrengthSessionLimitMinutes: sessionMinutes,
+            RequiresReducedVolumeAcknowledgment: requiresReducedVolumeAcknowledgment,
+            OriginalPlannedWorkingSets: totalOriginalWorkingSets,
+            ActualWorkingSets: totalActualWorkingSets,
+            MinimumRequiredSessionMinutes: minimumRequiredSessionMinutes);
+    }
+
+    private static bool ValidChoices(StrengthPlanPreviewChoices? choices) =>
+        choices is not null && Enum.IsDefined(choices.Activity) &&
+        (choices.Activity is WorkoutActivityType.GeneralStrength or WorkoutActivityType.HighVolumeStrength or
+            WorkoutActivityType.StrengthHighIntensity) &&
+        choices.LocalDate != default &&
+        (choices.ExcludedExerciseIds is null || choices.ExcludedExerciseIds.All(IsPositiveIdentifier)) &&
+        (choices.UserConfirmedFamiliarExerciseIds is null ||
+         choices.UserConfirmedFamiliarExerciseIds.All(IsPositiveIdentifier)) &&
+        (choices.UserConfirmedManageableLoadExerciseIds is null ||
+         choices.UserConfirmedManageableLoadExerciseIds.All(IsPositiveIdentifier)) &&
+        (choices.AcknowledgedSubstitutionPairKeys is null ||
+         choices.AcknowledgedSubstitutionPairKeys.All(key => !string.IsNullOrWhiteSpace(key))) &&
+        (choices.WarmupMinutes is null or >= NoMinutes) &&
+        (choices.CooldownMinutes is null or >= NoMinutes) &&
+        (choices.RequestedAvailableWeekdays is null || ValidWeekdays(choices.RequestedAvailableWeekdays));
+
+    private static bool ValidProfileData(StrengthPlanPreviewData data) =>
+        Enum.IsDefined(data.Goal) && Enum.IsDefined(data.Equipment) &&
+        (data.ProfileTrainingExperience is null || Enum.IsDefined(data.ProfileTrainingExperience.Value)) &&
+        (data.SelectedActivities is null || data.SelectedActivities.All(activity => Enum.IsDefined(activity))) &&
+        data.Catalog is not null && data.Catalog.All(entry => entry is not null && entry.Candidate is not null) &&
+        data.Catalog.Select(entry => entry.Candidate.ExerciseId).Distinct().Count() == data.Catalog.Count &&
+        (data.BlockedMovementPatterns is null ||
+         data.BlockedMovementPatterns.All(pattern => Enum.IsDefined(pattern))) &&
+        data.PreferredExerciseByOriginalId is not null &&
+        data.PreferredExerciseByOriginalId.All(pair => IsPositiveIdentifier(pair.Key) &&
+                                                        IsPositiveIdentifier(pair.Value)) &&
+        data.AcceptedExerciseIds is not null && data.AcceptedExerciseIds.All(IsPositiveIdentifier) &&
+        data.CompletedExerciseExposureCounts is not null &&
+        data.CompletedExerciseExposureCounts.All(pair => IsPositiveIdentifier(pair.Key) && pair.Value >= NoCompletedExposures) &&
+        data.KnownManageableLoadExerciseIds is not null &&
+        data.KnownManageableLoadExerciseIds.All(IsPositiveIdentifier) &&
+        data.SecondsPerRepByExerciseId is not null &&
+        data.SecondsPerRepByExerciseId.All(pair => IsPositiveIdentifier(pair.Key) && pair.Value > NoSecondsPerRep) &&
+        data.PrimaryMuscleByExerciseId is not null &&
+        data.PrimaryMuscleByExerciseId.All(pair => IsPositiveIdentifier(pair.Key) &&
+                                                     !string.IsNullOrWhiteSpace(pair.Value)) &&
+        data.ReviewedAllowedExerciseIdsByTemplateSlot is not null &&
+        data.ReviewedAllowedExerciseIdsByTemplateSlot.All(pair => !string.IsNullOrWhiteSpace(pair.Key) &&
+            pair.Value is not null && pair.Value.All(IsPositiveIdentifier)) &&
+        data.TemplateSlotReviewConditions is not null &&
+        data.TemplateSlotReviewConditions.All(pair => !string.IsNullOrWhiteSpace(pair.Key) &&
+                                                       !string.IsNullOrWhiteSpace(pair.Value));
+
+    private static bool ValidWeekdays(IReadOnlySet<DayOfWeek>? weekdays) =>
+        weekdays is { Count: >= MixedActivityWeekScheduleRule.MinimumAvailableWeekdays and
+            <= WorkoutPreferencesRule.MaximumDaysPerWeek } && weekdays.All(Enum.IsDefined);
+
+    private static bool IsValidActivityDuration(WorkoutActivityType activity, int minutes) =>
+        WorkoutPreferencesRule.IsValidSessionDuration(activity, minutes);
+
+    private static bool IsPositiveIdentifier(int value) => value >= FirstPositiveIdentifier;
+
+    /// <summary>Coverage gaps outrank goal tier priorities so an under-hit muscle gets the accessory slot.</summary>
+    private static Dictionary<int, int> MergeCoveragePriority(
+        IReadOnlyDictionary<int, int>? goalPriorities,
+        IReadOnlyCollection<int> coveragePriorityExerciseIds)
+    {
+        var merged = goalPriorities is null
+            ? new Dictionary<int, int>()
+            : new Dictionary<int, int>(goalPriorities);
+        foreach (var exerciseId in coveragePriorityExerciseIds)
+            merged[exerciseId] = LowerBodyCoverageRule.CoveragePriorityScore;
+        return merged;
+    }
+
+    private static void AddSessionMuscles(
+        IEnumerable<StrengthSlotSelection> slots,
+        IReadOnlyDictionary<int, IReadOnlySet<string>>? muscleGroupsByExerciseId,
+        List<IReadOnlyCollection<string>?> weeklySessionMuscles)
+    {
+        if (muscleGroupsByExerciseId is null) return;
+
+        var muscles = new List<string>();
+        foreach (var slot in slots)
+        {
+            if (slot.ExerciseId is not { } exerciseId) continue;
+            if (!muscleGroupsByExerciseId.TryGetValue(exerciseId, out var groups) || groups is null) continue;
+            muscles.AddRange(groups);
+        }
+
+        if (muscles.Count > 0)
+            weeklySessionMuscles.Add(muscles);
+    }
+
+    private static int ScheduledSessionsPerWeekFor(
+        WorkoutActivityType activity,
+        StrengthPlanPreviewData data,
+        StrengthPlanPreviewChoices choices)
+    {
+        var availableDays = GeneralStrengthFrequencyResolver.ResolveAvailableWeekdaysCount(
+            choices.RequestedAvailableWeekdays ?? data.AvailableWeekdays);
+        if (availableDays == OneSession)
+            return OneSession;
+
+        if (activity == WorkoutActivityType.GeneralStrength)
+        {
+            var isEstablished = GeneralStrengthFrequencyResolver.IsEstablishedResistanceHistory(
+                choices.ActivityHistory, choices.LocalDate);
+            var gsPolicy = GeneralStrengthFrequencyResolver.Resolve(
+                availableDays, isEstablished, data.ProfileTrainingExperience);
+            return Math.Min(gsPolicy.PolicySessionsPerWeek, gsPolicy.TargetSessionsPerWeek);
+        }
+
+        return activity switch
+        {
+            WorkoutActivityType.HighVolumeStrength => ActivityPrescriptionRule.HighVolumeStrengthSessionsPerWeek,
+            WorkoutActivityType.StrengthHighIntensity =>
+                ActivityPrescriptionRule.StrengthHighIntensityMaximumSessionsPerWeekInitially,
+            _ => NoSessions
+        };
+    }
+
+    // Compatibility entry point for existing callers; selected styles must never be
+    // silently replaced with an unselected style.
+    public static StrengthPlanPreviewResult EvaluateWithFallback(
+        StrengthPlanPreviewChoices? choices,
+        StrengthPlanPreviewData? data) => EvaluateDirect(choices, data);
+
+    private static int MaximumWorkingExercises(WorkoutActivityType activity,
+        StrengthTemplateDefinition template) => activity switch
+    {
+        WorkoutActivityType.HighVolumeStrength =>
+            ActivityPrescriptionRule.HighVolumeMaximumWorkingExercisesPerSession,
+        WorkoutActivityType.StrengthHighIntensity =>
+            ActivityPrescriptionRule.StrengthHighIntensityMaximumWorkingExercisesPerSession,
+        _ => template.Slots.Count
+    };
+
+    /// <summary>
+    /// Experience used for exercise eligibility. In-session swaps reuse it so a swap can never
+    /// admit an exercise the planner would have excluded for the same history and profile.
+    /// </summary>
+    public static ActivityExperience EligibilityExperience(WorkoutActivityType activity,
+        ActivityTrainingHistory? history, DateOnly localDate, TrainingExperienceLevel? profileExperience)
+    {
+        var historyExperience = ActivityExperienceRule.Classify(activity.ToString(), history, localDate).Experience;
+        return EligibilityExperience(activity, ProfileTrainingExperiencePlanningRule.Resolve(
+            historyExperience, profileExperience, history, allowProfileFallbackWhenHistoryMissing: true));
+    }
+
+    private static ActivityExperience EligibilityExperience(WorkoutActivityType activity,
+        ProfileTrainingExperienceDecision decision) =>
+        (activity is WorkoutActivityType.GeneralStrength or WorkoutActivityType.HighVolumeStrength) &&
+        decision.PrescriptionExperience == ActivityExperience.Unknown
+            ? ActivityExperience.Beginner
+            : decision.PrescriptionExperience;
+
+    /// <summary>Equipment kinds a saved equipment profile provides; an undefined profile provides none.</summary>
+    public static IReadOnlySet<ExerciseEquipmentKind> AvailableEquipmentFor(Equipment equipment) =>
+        AvailableEquipmentFor(equipment, null);
+
+    /// <summary>Equipment kinds available when explicit optional slider and anchor capabilities are considered.</summary>
+    public static IReadOnlySet<ExerciseEquipmentKind> AvailableEquipmentFor(
+        Equipment equipment,
+        EquipmentCapabilities? capabilities)
+    {
+        HashSet<ExerciseEquipmentKind> set = equipment switch
+        {
+            Equipment.FullGym =>
+            [
+                ExerciseEquipmentKind.Bodyweight,
+                ExerciseEquipmentKind.Barbell,
+                ExerciseEquipmentKind.Dumbbell,
+                ExerciseEquipmentKind.ResistanceBand,
+                ExerciseEquipmentKind.Cable,
+                ExerciseEquipmentKind.Machine,
+                ExerciseEquipmentKind.HipThrustBench,
+                ExerciseEquipmentKind.BackExtension45,
+                ExerciseEquipmentKind.PullUpBar,
+                ExerciseEquipmentKind.Kettlebell
+            ],
+            Equipment.HomeDumbbellsBands => BuildHomeDumbbellsBandsSet(capabilities),
+            Equipment.Bodyweight => BuildBodyweightSet(capabilities),
+            _ => new HashSet<ExerciseEquipmentKind>()
+        };
+
+        // Gate 60: sliders and secure band anchors must be explicitly confirmed and are never inferred.
+        if (capabilities?.HasSliders == true)
+            set.Add(ExerciseEquipmentKind.Sliders);
+        if (capabilities?.HasConfirmedBandAnchor == true && set.Contains(ExerciseEquipmentKind.ResistanceBand))
+            set.Add(ExerciseEquipmentKind.BandAnchor);
+
+        return set;
+    }
+
+    private static HashSet<ExerciseEquipmentKind> BuildHomeDumbbellsBandsSet(EquipmentCapabilities? capabilities)
+    {
+        var set = new HashSet<ExerciseEquipmentKind> { ExerciseEquipmentKind.Bodyweight };
+        if (capabilities?.HasDumbbells != false)
+            set.Add(ExerciseEquipmentKind.Dumbbell);
+        if (capabilities?.HasBands != false)
+            set.Add(ExerciseEquipmentKind.ResistanceBand);
+        return set;
+    }
+
+    private static HashSet<ExerciseEquipmentKind> BuildBodyweightSet(EquipmentCapabilities? capabilities)
+    {
+        var set = new HashSet<ExerciseEquipmentKind> { ExerciseEquipmentKind.Bodyweight };
+        if (capabilities?.HasBands == true)
+            set.Add(ExerciseEquipmentKind.ResistanceBand);
+        return set;
+    }
+
+    private static decimal? EstimateAndTrimOptional(List<StrengthSlotSelection> selected,
+        StrengthPlanPreviewData data, int availableMinutes, int warmupMinutes, int cooldownMinutes,
+        TemplateVolumeFloor floor, bool allowMovementOmissions, string templateId,
+        List<string> movementOmissions, out decimal? completeMinimumMinutes)
+    {
+        decimal? Estimate()
+        {
+            decimal totalMinutes = warmupMinutes + cooldownMinutes;
+            foreach (var slot in selected)
+            {
+                if (slot.ExerciseId is not { } exerciseId || slot.Sets is not > NoDirectSets ||
+                    slot.MinimumRepetitions is not > NoDirectSets || slot.RestSeconds is not >= NoMinutes ||
+                    !data.SecondsPerRepByExerciseId!.TryGetValue(exerciseId, out var secondsPerRep) ||
+                    secondsPerRep <= NoSecondsPerRep)
+                    return null;
+
+                var entry = data.Catalog!.SingleOrDefault(item => item.Candidate.ExerciseId == exerciseId);
+                if (entry?.Candidate.SetupMinutes is not { } setupMinutes || setupMinutes < NoSetupMinutes)
+                    return null;
+
+                var unilateralFactor = entry.Candidate.UnilateralDoublesTime
+                    ? UnilateralTimeMultiplier
+                    : StandardTimeMultiplier;
+                totalMinutes += setupMinutes +
+                    (decimal)slot.Sets.Value * slot.MinimumRepetitions.Value * secondsPerRep *
+                    unilateralFactor / SecondsPerMinute +
+                    (decimal)(slot.Sets.Value - OneSession) * slot.RestSeconds.Value / SecondsPerMinute;
+            }
+
+            return totalMinutes;
+        }
+
+        completeMinimumMinutes = null;
+        var estimate = Estimate();
+        while ((estimate is null || estimate > availableMinutes) &&
+               selected.LastOrDefault(slot => !slot.IsRequired) is { } optional)
+        {
+            selected.Remove(optional);
+            estimate = Estimate();
+        }
+
+        if (estimate is null || estimate > availableMinutes)
+        {
+            const int SingleSetDecrement = 1;
+            bool canReduceFurther;
+            do
+            {
+                canReduceFurther = false;
+                for (var i = selected.Count - 1; i >= 0; i--)
+                {
+                    var slot = selected[i];
+                    if (slot.Sets is not { } currentSets) continue;
+                    var floorMin = floor.MinimumSetsBySlotId.GetValueOrDefault(
+                        slot.SlotId, currentSets);
+                    if (currentSets > floorMin)
+                    {
+                        var newSets = currentSets - SingleSetDecrement;
+                        selected[i] = slot with { Sets = newSets };
+                        canReduceFurther = true;
+                        estimate = Estimate();
+                        if (estimate is > NoMinutes && estimate <= availableMinutes)
+                            break;
+                    }
+                }
+            } while (canReduceFurther && (estimate is null || estimate > availableMinutes));
+        }
+
+        if (estimate is > NoMinutes && estimate > availableMinutes)
+        {
+            completeMinimumMinutes = estimate;
+            while (allowMovementOmissions && estimate > availableMinutes && selected.Count > OneSession)
+            {
+                var omitted = selected[^1];
+                selected.RemoveAt(selected.Count - OneSession);
+                movementOmissions.Add($"{MovementOmittedForDurationCode}:{templateId}:{omitted.SlotId}");
+                estimate = Estimate();
+                if (estimate is null) break;
+            }
+        }
+        return estimate is > NoMinutes && estimate <= availableMinutes ? estimate : null;
+    }
+
+    private static Dictionary<string, string> SlotConditions(
+        StrengthTemplateDefinition template, StrengthPlanPreviewData data) =>
+        template.Slots.ToDictionary(slot => slot.SlotId,
+            slot => data.TemplateSlotReviewConditions!.GetValueOrDefault(
+                $"{template.TemplateId}|{slot.SlotId}") ?? MissingTemplateSlotReview,
+            StringComparer.Ordinal);
+
+    private static StrengthExerciseReviewCondition[] ExerciseReviewConditions(
+        IReadOnlyList<StrengthTemplateDefinition> templates, StrengthPlanPreviewData data)
+    {
+        var relevantIds = data.ReviewedAllowedExerciseIdsByTemplateSlot!
+            .Where(pair => templates.Any(template => pair.Key.StartsWith(
+                template.TemplateId + "|", StringComparison.Ordinal)))
+            .SelectMany(pair => pair.Value).ToHashSet();
+        // Rationale exists only where the reviewed catalog supplies real exercise-specific text.
+        // An exercise with nothing to say is dropped instead of travelling as an empty string, so
+        // the preview cannot render a blank rationale row.
+        return data.Catalog!
+            .Where(entry => relevantIds.Contains(entry.Candidate.ExerciseId))
+            .OrderBy(entry => entry.Candidate.ExerciseId)
+            .Select(entry => new StrengthExerciseReviewCondition(entry.Candidate.ExerciseId,
+                entry.Name, TrimToNull(entry.Candidate.ExperienceConditions),
+                TrimToNull(entry.Candidate.ReviewConditions)))
+            .Where(condition => condition.ExperienceConditions is not null ||
+                                condition.ReviewConditions is not null)
+            .ToArray();
+    }
+
+    private static string? TrimToNull(string? value) =>
+        string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+
+    private static StrengthPlanPreviewResult Failure(StrengthPlanPreviewStatus status,
+        ActivityExperience experience, params string[] reasons) =>
+        new(status, experience, [], [.. reasons], [], []);
+}

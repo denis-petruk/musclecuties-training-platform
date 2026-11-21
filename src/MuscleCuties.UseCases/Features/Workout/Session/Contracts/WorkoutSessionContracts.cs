@@ -1,0 +1,173 @@
+namespace MuscleCuties.UseCases.Features.Workout.Session.Contracts;
+
+public sealed record ObservedSetRecord(
+    int SetIndex,
+    int RepsCompleted,
+    decimal LoadKg,
+    int? RirActual = null,
+    bool TechniqueAcceptable = true,
+    int? LeftSideReps = null,
+    int? RightSideReps = null);
+
+public sealed record WorkoutExerciseLogDto(
+    int WorkoutDayExerciseId,
+    int ExerciseId,
+    int CompletedSets,
+    int CompletedReps,
+    float? WeightKg,
+    int? CompletedDurationSeconds = null,
+    float? DistanceKm = null,
+    int? AverageHeartRateBpm = null,
+    int? PaceSecondsPerKm = null,
+    int? PowerWatts = null,
+    int? CadenceRpm = null,
+    int? EffortRating = null,
+    IReadOnlyList<ObservedSetRecord>? ObservedSets = null);
+
+public sealed record ActivityActualLogDto(
+    int? WorkoutDayActivityId,
+    MuscleCuties.UseCases.Features.Workout.Contracts.WorkoutActivityDto ActivityType,
+    int DurationSeconds,
+    decimal? DistanceKm = null,
+    int? DistanceMeters = null,
+    int? PaceSecondsPerKm = null,
+    int? PaceSecondsPer100m = null,
+    int? AverageHeartRateBpm = null,
+    int? PowerWatts = null,
+    int? Cadence = null,
+    int? StrokeCount = null,
+    int? EffortRpe = null,
+    string? Notes = null);
+
+public sealed record LogWorkoutSessionRequest(
+    int WorkoutDayId,
+    DateOnly Date,
+    IReadOnlyList<WorkoutExerciseLogDto>? Exercises = null,
+    Guid? PlannedSessionId = null,
+    IReadOnlyList<ActivityActualLogDto>? ActivityActuals = null);
+
+public sealed record SwapWorkoutExerciseRequest(
+    int WorkoutDayExerciseId,
+    int NewExerciseId,
+    bool SavePreference);
+
+public sealed record WorkoutSwapCandidateDto(
+    int ExerciseId,
+    string Name,
+    string MuscleMatch,
+    string Equipment,
+    string PrimaryMuscles);
+
+public sealed record SaveWorkoutMovementNoteRequest(int WorkoutDayExerciseId, string? Notes);
+public sealed record SetWorkoutExerciseOptionalRequest(int WorkoutDayExerciseId, bool IsOptional, int OptionalSets);
+public sealed record SplitWorkoutSupersetRequest(Guid SessionId, int WorkoutDayExerciseId, int SupersetGroupId);
+
+public sealed record WorkoutMovementNoteDto(int WorkoutDayExerciseId, string Notes);
+
+public sealed record WorkoutSetDetailDto(
+    int SetNumber,
+    double WeightKg,
+    int RepsCompleted,
+    double? Rpe,
+    bool IsWarmup,
+    int RestTimeSeconds,
+    int? LeftSideReps = null,
+    int? RightSideReps = null)
+{
+    public bool IsObserved { get; init; }
+    public bool TechniqueAcceptable { get; init; } = true;
+}
+
+public sealed record WorkoutExerciseDetailDto(
+    int WorkoutDayExerciseId,
+    int ExerciseId,
+    string Name,
+    string ActivityTag,
+    bool IsLogged,
+    IReadOnlyList<WorkoutSetDetailDto> Sets)
+{
+    public int PlannedSets { get; init; }
+    public int PlannedWarmUpSets { get; init; }
+    public int MinRepetitions { get; init; }
+    public int MaxRepetitions { get; init; }
+    public int TargetRir { get; init; }
+    public int RestSeconds { get; init; }
+    public int? SupersetGroupId { get; init; }
+    public bool IsUnilateral { get; init; }
+    public string LoadStatus { get; init; } = string.Empty;
+    public decimal? PrescribedLoadKg { get; init; }
+    public bool RequiresInitialCalibration { get; init; }
+    public int OptionalSets { get; init; }
+    public bool IsOptional { get; init; }
+    public string ActivityTitle { get; init; } = string.Empty;
+    public string Description { get; init; } = string.Empty;
+    public string ImageUrl { get; init; } = string.Empty;
+    public string VideoUrl { get; init; } = string.Empty;
+    public string TechniqueNotes { get; init; } = string.Empty;
+    public string QuickTipsText { get; init; } = string.Empty;
+    public string TargetText { get; init; } = string.Empty;
+    public string PreviousText { get; init; } = string.Empty;
+    public string RecommendationText { get; init; } = string.Empty;
+    public string RecommendationCode { get; init; } = string.Empty;
+    public decimal? RecommendationLoadKg { get; init; }
+    public string MovementNotes { get; init; } = string.Empty;
+    public string LoggedSetsText { get; init; } = string.Empty;
+    public string LoggedRepsText { get; init; } = string.Empty;
+    public string LoggedWeightText { get; init; } = string.Empty;
+    public string LoggedDurationMinutesText { get; init; } = string.Empty;
+    public string LoggedDistanceKmText { get; init; } = string.Empty;
+    public string LoggedPaceText { get; init; } = string.Empty;
+    public string LoggedHeartRateText { get; init; } = string.Empty;
+    public string LoggedPowerWattsText { get; init; } = string.Empty;
+    public string LoggedCadenceRpmText { get; init; } = string.Empty;
+    public string LoggedEffortText { get; init; } = string.Empty;
+    public string DurationLabel { get; init; } = string.Empty;
+    public string DistanceLabel { get; init; } = string.Empty;
+    public string PaceLabel { get; init; } = string.Empty;
+    public bool UsesEnduranceMetrics { get; init; }
+    public bool UsesDurationMetric { get; init; }
+    public bool UsesDistanceMetric { get; init; }
+    public bool UsesPaceMetric { get; init; }
+    public bool UsesHeartRateMetric { get; init; }
+    public bool UsesPowerMetric { get; init; }
+    public bool UsesCadenceMetric { get; init; }
+    public bool UsesEffortMetric { get; init; }
+    public bool UsesWeight { get; init; }
+}
+
+public sealed record WorkoutActivityDetailDto(
+    int OrderIndex,
+    int TotalActivities,
+    string Tag,
+    string Title,
+    string Subtitle,
+    string MetricText,
+    string SummaryText,
+    IReadOnlyList<int> WorkoutDayExerciseIds)
+{
+    public MuscleCuties.UseCases.Features.Workout.Planning.ActivitySessionPrescriptionOutputV020? Prescription { get; init; }
+    public MuscleCuties.UseCases.Features.Workout.Contracts.WorkoutActivityDto ActivityType { get; init; }
+        = MuscleCuties.UseCases.Features.Workout.Contracts.WorkoutActivityDto.Other;
+}
+
+public enum WorkoutDoseAdjustmentReason { DailyReadiness, ProvisionalPhaseFeeling, RepeatedPhasePattern, SafetyReview }
+public enum WorkoutDoseAdjustmentConfidence { Provisional, Repeated, Current }
+
+public sealed record WorkoutSessionDetailDto(
+    int WorkoutDayId,
+    string Title,
+    string Subtitle,
+    string SummaryText,
+    bool IsRestDay,
+    IReadOnlyList<WorkoutExerciseDetailDto> Exercises,
+    IReadOnlyList<WorkoutActivityDetailDto> Activities)
+{
+    public int? GeneralWarmupMinutes { get; init; }
+    public decimal? EstimatedTotalMinutes { get; init; }
+    public MuscleCuties.UseCases.Features.Workout.Planning.GenerationFinisherV2? AttachedFinisher { get; init; }
+    public bool IsOptional { get; init; }
+    public bool IsEasierAlternative { get; init; }
+    public WorkoutDoseAdjustmentReason? DoseAdjustmentReason { get; init; }
+    public WorkoutDoseAdjustmentConfidence? DoseAdjustmentConfidence { get; init; }
+    public string? DoseAdjustmentPolicyVersion { get; init; }
+}

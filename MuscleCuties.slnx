@@ -1,0 +1,14 @@
+<Solution>
+  <Folder Name="/services/">
+    <Project Path="services/MuscleCuties.Server/MuscleCuties.Server.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/MuscleCuties.Contracts/MuscleCuties.Contracts.csproj" />
+    <Project Path="src/MuscleCuties.Core/MuscleCuties.Core.csproj" />
+    <Project Path="src/MuscleCuties.Infrastructure.PostgreSql/MuscleCuties.Infrastructure.PostgreSql.csproj" />
+    <Project Path="src/MuscleCuties.UseCases/MuscleCuties.UseCases.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/MuscleCuties.Core.Tests/MuscleCuties.Core.Tests.csproj" />
+  </Folder>
+</Solution>

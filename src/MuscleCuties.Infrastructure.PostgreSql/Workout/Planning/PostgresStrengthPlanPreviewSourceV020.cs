@@ -1,0 +1,307 @@
+using System.Text.Json;
+using Microsoft.EntityFrameworkCore;
+using MuscleCuties.Infrastructure.PostgreSql.Workout.ActiveSession;
+using MuscleCuties.Core.Domain.Workout;
+using MuscleCuties.Core.Domain.Workout.Planning;
+using MuscleCuties.Core.Domain.Workout.Planning.Catalog;
+using MuscleCuties.Core.Domain.Workout.Planning.V2;
+using MuscleCuties.Core.Domain.Health;
+using MuscleCuties.Core.Models.Enums.Users;
+using MuscleCuties.Core.Models.Enums.Workout;
+using MuscleCuties.Core.Models.Workout.Planning;
+using MuscleCuties.Infrastructure.PostgreSql.Persistence;
+using MuscleCuties.UseCases.Features.Workout.Planning;
+
+namespace MuscleCuties.Infrastructure.PostgreSql.Workout.Planning;
+
+public sealed class PostgresStrengthPlanPreviewSourceV020(PostgresDbContext dbContext)
+    : IStrengthPlanPreviewSourceV020
+{
+    public Task<StrengthPlanPreviewSourceV020?> LoadAsync(Guid userId,
+        CancellationToken cancellationToken) =>
+        dbContext.Database.CreateExecutionStrategy().ExecuteAsync<StrengthPlanPreviewSourceV020?>(async () =>
+        {
+            dbContext.ChangeTracker.Clear();
+            await using var transaction = await dbContext.Database.BeginTransactionAsync(cancellationToken)
+                .ConfigureAwait(false);
+            await PostgresTenantContext.SetForCurrentTransactionAsync(dbContext, userId, cancellationToken)
+                .ConfigureAwait(false);
+            await WorkoutSessionAccountLock.AcquireAsync(dbContext, userId, cancellationToken).ConfigureAwait(false);
+            await PlanningCatalogFingerprint.LockCatalogAsync(dbContext, cancellationToken).ConfigureAwait(false);
+
+            var result = await LoadInCurrentTransactionAsync(userId, cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return result;
+        });
+
+    // Caller owns the tenant transaction and account/catalog locks.
+    internal async Task<StrengthPlanPreviewSourceV020?> LoadInCurrentTransactionAsync(Guid userId,
+        CancellationToken cancellationToken)
+    {
+        if (dbContext.Database.CurrentTransaction is null)
+            throw new InvalidOperationException("A planning transaction is required.");
+
+        var profile = await dbContext.UserProfiles.AsNoTracking()
+            .SingleOrDefaultAsync(row => row.UserId == userId, cancellationToken)
+            .ConfigureAwait(false);
+        var planningState = await dbContext.WorkoutAccountPlanningStates.AsNoTracking()
+            .SingleOrDefaultAsync(row => row.UserId == userId, cancellationToken).ConfigureAwait(false);
+        // Missing answers stay missing: the placeholders below are never planned with, because the
+        // preview reports EquipmentAnswerMissing / GoalAnswerMissing as required answers first.
+        var parsedGoal = PlanningSafetyInputs.ParseGoal(profile?.Goal);
+        var parsedEquipment = PlanningSafetyInputs.ParseEquipment(profile?.EquipmentLevel);
+        var goal = parsedGoal ?? UserGoal.MaintainHealth;
+        var equipment = parsedEquipment ?? Equipment.Bodyweight;
+        var definitions = await dbContext.WorkoutExerciseDefinitions.AsNoTracking()
+            .Include(row => row.MuscleContributions)
+            .ThenInclude(row => row.MuscleGroup)
+            .OrderBy(row => row.Id).ToListAsync(cancellationToken).ConfigureAwait(false);
+        var goalTierWeights = await dbContext.GoalTierWeights.AsNoTracking()
+            .OrderBy(row => row.MuscleGroupId).ThenBy(row => row.Id)
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        var goalPriorityByExerciseId = GoalSpecificAccessoryPriorityRule.Resolve(
+            goal,
+            definitions.SelectMany(definition => definition.MuscleContributions.Select(contribution =>
+                new PlanningMuscleContribution(contribution.Id, definition.Id,
+                    contribution.MuscleGroupId, (double)contribution.Fraction))).ToArray(),
+            goalTierWeights.Where(weight => weight.Goal == goal).Select(weight => new PlanningGoalTierWeight(
+                weight.Id, weight.Goal, weight.MuscleGroupId, weight.Tier)).ToArray());
+        var floorRows = await ReviewedTemplateFloorSource.LoadAsync(dbContext, cancellationToken).ConfigureAwait(false);
+        var reviewedSlots = ReviewedExerciseCatalogV020ReviewMap.MapSlots(definitions);
+        var preferences = await dbContext.UserExercisePreferences.AsNoTracking()
+            .Where(row => row.UserId == userId)
+            .OrderBy(row => row.CreatedAt).ThenBy(row => row.Id)
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        var injuries = await dbContext.WorkoutInjuryLogs.AsNoTracking()
+            .Where(row => row.UserId == userId)
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        var episodes = await dbContext.WorkoutInjuryEpisodes.AsNoTracking()
+            .Where(row => row.UserId == userId).ToListAsync(cancellationToken).ConfigureAwait(false);
+        var today = PlanningSafetyInputs.AccountToday(planningState?.TimeZoneId);
+        var observed = await V2ObservedHistory.LoadAsync(dbContext, userId,
+            planningState?.TimeZoneId ?? "UTC", cancellationToken).ConfigureAwait(false);
+        var observedCardio = await V2ObservedHistory.LoadCardioAsync(dbContext, userId,
+            planningState?.TimeZoneId ?? "UTC", cancellationToken).ConfigureAwait(false);
+        var creditedDates = await dbContext.WorkoutCompletionDayCredits.AsNoTracking()
+            .Where(row => row.UserId == userId)
+            .Select(row => row.LocalDate).Distinct().ToListAsync(cancellationToken).ConfigureAwait(false);
+        var experience = PlanningSafetyInputs.ProfileTrainingExperience(planningState, profile);
+        var lastCompletedDate = creditedDates.Select(date => (DateOnly?)date)
+            .Concat(observed.Where(set => set.LocalDate <= today).Select(set => (DateOnly?)set.LocalDate)).Max();
+        var establishedHistory = creditedDates.Count >= WorkoutExperiencePromotionRule.IntermediateCompletedDays ||
+            experience is TrainingExperienceLevel.Intermediate or TrainingExperienceLevel.Advanced;
+        var returningAfterDetraining = establishedHistory && lastCompletedDate is { } last &&
+            today is { } accountToday && accountToday.DayNumber - last.DayNumber > WorkoutPolicyV2.DetrainingGapDays;
+        var painReturns = await V2PainReturnSource.LoadAsync(dbContext, userId, observed, cancellationToken).ConfigureAwait(false);
+        var readiness = today is { } localToday
+            ? await dbContext.DailyReadinessLogs.AsNoTracking().SingleOrDefaultAsync(row =>
+                row.UserId == userId && row.Date == localToday, cancellationToken).ConfigureAwait(false)
+            : null;
+        var relevantInjuries = PlanningSafetyInputs.RelevantInjuries(injuries, episodes, today);
+        var blockedMovementPatterns = PlanningSafetyInputs.BlockedMovementPatterns(relevantInjuries, definitions);
+        // The reviewed site/status table is the only source of activity-level injury restriction.
+        // Unknown status fails closed as Acute; cleared injuries never restrict an activity.
+        var restrictedActivityTypes = InjuryActivityRestrictionRule.GetBlockedActivities(
+                relevantInjuries.Select(injury => new MuscleCuties.Core.Models.Workout.Planning.Injury(
+                    (InjuryFlag)injury.SiteFlag,
+                    Enum.TryParse<InjuryStatus>(injury.Status, true, out var status) ? status : InjuryStatus.Acute,
+                    injury.Since)))
+            .Select(activity => (int)activity).ToHashSet();
+        var logs = await dbContext.WorkoutExerciseLogs.AsNoTracking()
+            .Where(row => row.UserId == userId && row.CompletedSets > 0 && row.CompletedReps > 0)
+            .Select(row => new { row.ExerciseId, row.WorkoutLogId, row.WeightKg })
+            .OrderBy(row => row.WorkoutLogId).ThenBy(row => row.ExerciseId).ThenBy(row => row.WeightKg)
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        var activePlanId = await dbContext.WorkoutPlans.AsNoTracking()
+            .Where(row => row.UserId == userId && row.IsActive)
+            .OrderByDescending(row => row.CreatedAt)
+            .Select(row => (Guid?)row.Id)
+            .FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+        var acceptedExerciseIds = new HashSet<int>();
+        Guid? activeRevisionId = null;
+        if (activePlanId is { } planId)
+        {
+            activeRevisionId = await dbContext.WorkoutPlanRevisionsV02.AsNoTracking()
+                .Where(row => row.UserId == userId && row.PlanId == planId)
+                .OrderByDescending(row => row.RevisionNumber).Select(row => (Guid?)row.Id)
+                .FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+            var dayIds = await dbContext.WorkoutDays.AsNoTracking()
+                .Where(row => row.UserId == userId && row.WorkoutPlanId == planId)
+                .Select(row => row.Id).ToArrayAsync(cancellationToken).ConfigureAwait(false);
+            acceptedExerciseIds = (await dbContext.WorkoutDayExercises.AsNoTracking()
+                .Where(row => row.UserId == userId && dayIds.Contains(row.WorkoutDayId))
+                .Select(row => row.ExerciseId).ToListAsync(cancellationToken).ConfigureAwait(false))
+                .ToHashSet();
+        }
+        return new StrengthPlanPreviewSourceV020(
+            goal, equipment,
+            PlanningSafetyInputs.ActiveInjuryFlags(relevantInjuries),
+            relevantInjuries.Any(injury => injury.Pain > 0),
+            definitions.Select(WorkoutExerciseV020CatalogMapper.Map).ToArray(),
+            preferences.GroupBy(row => row.OriginalExerciseId)
+                .ToDictionary(group => group.Key, group => group.Last().PreferredExerciseId),
+            acceptedExerciseIds,
+            logs.GroupBy(row => row.ExerciseId)
+                .ToDictionary(group => group.Key,
+                    group => group.Select(row => row.WorkoutLogId).Distinct().Count()),
+            logs.Where(row => row.WeightKg is > 0)
+                .Select(row => row.ExerciseId).ToHashSet(),
+            definitions.Where(row => row.SecondsPerRep > 0)
+                .ToDictionary(row => row.Id, row => (int)row.SecondsPerRep),
+            definitions.Where(row => row.MuscleContributions.Any())
+                .ToDictionary(row => row.Id, row => row.MuscleContributions
+                    .OrderByDescending(contribution => contribution.Fraction)
+                    .ThenBy(contribution => contribution.MuscleGroupId)
+                    .First().MuscleGroup?.Name ?? string.Empty),
+            reviewedSlots.AllowedIds,
+            reviewedSlots.Conditions)
+        {
+            BirthDate = profile?.DateOfBirth,
+            AccountTimeZoneId = planningState?.TimeZoneId ?? "UTC",
+            PriorObservedSets = observed,
+            PriorCardioActuals = observedCardio,
+            DistinctCompletedWorkoutDays = creditedDates.Count,
+            IsReturningAfterDetraining = returningAfterDetraining,
+            PainRestrictions = painReturns,
+            DailyReadiness = readiness is null ? null : new DailyReadinessInputV2(readiness.Energy,
+                readiness.PlanningFatigue, readiness.PlanningSleepQuality, readiness.SleepHours, readiness.PlanningSoreness),
+            PregnancyStatus = ReproductiveContextCodec.Parse(profile?.ReproductiveContextJson).Pregnancy,
+            GluteFocus = profile?.GluteFocus ?? false,
+            EquipmentAnswerMissing = parsedEquipment is null,
+            GoalAnswerMissing = parsedGoal is null,
+            SelectedActivityTypes = ParseActivityTypes(profile?.PreferredWorkoutActivityTypes),
+            ExcludedExerciseIds = PlanningSafetyInputs.ParseExcludedExerciseIds(profile?.ExcludedStrengthExerciseIdsJson),
+            AvailableWeekdays = ParseAvailableWeekdays(profile?.AvailableWorkoutWeekdaysJson),
+            ActivitySessionDurationsMinutes = ParseActivityDurations(profile?.ActivitySessionDurationsJson),
+            RequestedSessionsPerWeek = ParseActivityFrequencies(
+                profile?.RequestedActivitySessionsPerWeekJson),
+            ProfileTrainingExperience = PlanningSafetyInputs.ProfileTrainingExperience(planningState, profile),
+            MuscleGroupsByExerciseId = definitions
+                .Where(row => row.MuscleContributions.Any(contribution => contribution.Fraction > 0) &&
+                    row.MuscleContributions.Where(contribution => contribution.Fraction > 0)
+                        .All(contribution => !string.IsNullOrWhiteSpace(contribution.MuscleGroup?.Name)))
+                .ToDictionary(row => row.Id, row => (IReadOnlySet<string>)row.MuscleContributions
+                    .Where(contribution => contribution.Fraction > 0)
+                    .Select(contribution => contribution.MuscleGroup!.Name)
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase)),
+            MuscleContributionsByExerciseId = definitions
+                .Where(row => row.MuscleContributions.Any(contribution => contribution.Fraction > 0) &&
+                    row.MuscleContributions.Where(contribution => contribution.Fraction > 0)
+                        .All(contribution => !string.IsNullOrWhiteSpace(contribution.MuscleGroup?.Name)))
+                .ToDictionary(row => row.Id, row => (IReadOnlyList<CatalogMuscleRow>)row.MuscleContributions
+                    .Where(contribution => contribution.Fraction > 0)
+                    .Select(contribution => new CatalogMuscleRow(
+                        contribution.MuscleGroupId, contribution.MuscleGroup!.Name, contribution.Fraction))
+                    .ToArray()),
+            GoalPriorityByExerciseId = goalPriorityByExerciseId,
+            TemplateVolumeFloors = ReviewedTemplateFloorSource.Map(floorRows),
+            ProfileVersion = profile?.ConcurrencyVersion,
+            PopulationLimitationCode = WorkoutPopulationScopeRule.Limitation(profile?.DateOfBirth, today,
+                ReproductiveContextCodec.Parse(profile?.ReproductiveContextJson).Pregnancy),
+            CatalogFingerprint = PlanningCatalogFingerprint.FromInputs(definitions, goalTierWeights, preferences, floorRows),
+            InjuryFingerprint = PlanningInputFingerprint.Injuries(injuries),
+            RestrictedActivityTypes = restrictedActivityTypes,
+            BlockedMovementPatterns = blockedMovementPatterns,
+            ActivePlanId = activePlanId,
+            ActiveRevisionId = activeRevisionId,
+            HistoryFingerprint = PlanningInputFingerprint.Hash(logs),
+            TimeZoneVersion = planningState?.TimeZoneVersion ?? WorkoutAccountCalendarRule.InitialTimeZoneVersion,
+            CurrentAccountLocalDate = today,
+            ExperienceVersion = planningState?.ExperienceVersion ?? 0,
+            AnswerVersion = planningState?.AnswerVersion ?? 0,
+            ObservedHistoryFingerprint = PlanningInputFingerprint.Hash(observed),
+            ReadinessRevision = readiness?.PlanningRevision,
+            SavedAnswers = string.IsNullOrWhiteSpace(planningState?.AnswersJson)
+                ? new SavedActivityAnswersDto(0, [], null)
+                : JsonSerializer.Deserialize<SavedActivityAnswersDto>(planningState.AnswersJson,
+                    new JsonSerializerOptions(JsonSerializerDefaults.Web))
+        };
+    }
+
+    private static IReadOnlySet<int> ParseActivityTypes(string? value)
+    {
+        var set = (value ?? string.Empty).Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+            .Select(item => Enum.TryParse<WorkoutActivityType>(item, true, out var activity) && Enum.IsDefined(activity)
+                ? (int?)activity
+                : null)
+            .Where(activity => activity.HasValue)
+            .Select(activity => activity!.Value)
+            .ToHashSet();
+        if (set.Count == 0)
+            set.Add((int)WorkoutActivityType.GeneralStrength);
+        return set;
+    }
+
+    private static IReadOnlySet<DayOfWeek> ParseAvailableWeekdays(string? json)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(string.IsNullOrWhiteSpace(json) ? "[]" : json);
+            if (document.RootElement.ValueKind != JsonValueKind.Array)
+                return new HashSet<DayOfWeek>();
+            var set = document.RootElement.EnumerateArray()
+                .Select(value => value.ValueKind switch
+                {
+                    JsonValueKind.String when Enum.TryParse<DayOfWeek>(value.GetString(), true, out var day) && Enum.IsDefined(day) => (DayOfWeek?)day,
+                    JsonValueKind.Number when value.TryGetInt32(out var dayValue) && Enum.IsDefined(typeof(DayOfWeek), dayValue) => (DayOfWeek?)dayValue,
+                    _ => null
+                })
+                .Where(day => day.HasValue)
+                .Select(day => day!.Value)
+                .ToHashSet();
+            return set;
+        }
+        catch (JsonException)
+        {
+            return new HashSet<DayOfWeek>();
+        }
+    }
+
+    private static IReadOnlyDictionary<int, int> ParseActivityDurations(string? json)
+    {
+        var result = new Dictionary<int, int>();
+        try
+        {
+            using var document = JsonDocument.Parse(string.IsNullOrWhiteSpace(json) ? "{}" : json);
+            if (document.RootElement.ValueKind == JsonValueKind.Object)
+            {
+                foreach (var property in document.RootElement.EnumerateObject())
+                {
+                    if (Enum.TryParse<WorkoutActivityType>(property.Name, true, out var activity) &&
+                        Enum.IsDefined(activity) && property.Value.TryGetInt32(out var minutes) &&
+                        ActivitySessionDurationRule.ForUserPreference(activity) is not null)
+                        result[(int)activity] = minutes;
+                }
+            }
+        }
+        catch (JsonException)
+        {
+        }
+
+        return result;
+    }
+
+    private static IReadOnlyDictionary<int, int> ParseActivityFrequencies(string? json)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(string.IsNullOrWhiteSpace(json) ? "{}" : json);
+            if (document.RootElement.ValueKind != JsonValueKind.Object)
+                return new Dictionary<int, int>();
+            var result = new Dictionary<int, int>();
+            foreach (var property in document.RootElement.EnumerateObject())
+            {
+                if (Enum.TryParse<WorkoutActivityType>(property.Name, true, out var activity) &&
+                    Enum.IsDefined(activity) && property.Value.TryGetInt32(out var sessionsPerWeek) &&
+                    WorkoutPreferencesRule.RequiresExplicitWeeklyFrequency(activity))
+                    result[(int)activity] = sessionsPerWeek;
+            }
+            return result;
+        }
+        catch (JsonException)
+        {
+            return new Dictionary<int, int>();
+        }
+    }
+
+}

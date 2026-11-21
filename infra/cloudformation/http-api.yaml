@@ -1,0 +1,41 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Routes the MuscleCuties HTTP API to an existing Lambda alias in the same account and region.
+Parameters:
+  FunctionAliasArn:
+    Type: String
+    Description: Qualified ARN of the serving Lambda alias
+    AllowedPattern: '^arn:[^:]+:lambda:[a-z0-9-]+:[0-9]{12}:function:[A-Za-z0-9_-]+:[A-Za-z][A-Za-z0-9_-]*$'
+Resources:
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Ref AWS::StackName
+      ProtocolType: HTTP
+  Integration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationMethod: POST
+      IntegrationUri: !Ref FunctionAliasArn
+      PayloadFormatVersion: '2.0'
+      TimeoutInMillis: 30000
+  DefaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: '$default'
+      Target: !Sub 'integrations/${Integration}'
+  Stage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: '$default'
+      AutoDeploy: true
+  InvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref FunctionAliasArn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/$default'
